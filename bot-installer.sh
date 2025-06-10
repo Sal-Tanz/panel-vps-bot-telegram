@@ -1081,7 +1081,7 @@ case "${1:-install}" in
         test_bot_config
         ;;
     *)
-        echo "VPS Admin Bot Installer - Fixed Version"
+        echo "VPS Admin Bot Installer"
         echo "Usage: $0 {install|uninstall|status|restart|logs|update|backup|restore|test}"
         echo
         echo "Commands:"
