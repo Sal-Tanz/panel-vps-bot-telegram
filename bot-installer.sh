@@ -1,6 +1,4 @@
 #!/bin/bash
-
-# VPS Admin Bot Installer - Fixed Version
 # Script untuk install dan setup bot Telegram VPS Admin
 
 set -e
@@ -59,7 +57,7 @@ install_dependencies() {
     apt install -y systemd
     
     # Install speedtest-cli
-    pip3 install speedtest-cli
+    pip3 install speedtest-cli --break-system-packages
     
     print_success "Dependencies installed successfully"
 }
