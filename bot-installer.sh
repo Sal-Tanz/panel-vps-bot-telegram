@@ -75,7 +75,7 @@ setup_environment() {
     source venv/bin/activate
     
     # Install Python packages
-    pip install python-telegram-bot==20.7 psutil requests
+    pip install python-telegram-bot==20.7 psutil requests --break-system-packages
     
     # Buat log file
     touch $LOG_FILE
