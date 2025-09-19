@@ -504,15 +504,33 @@ class VPSAdminBot:
         finally:
             self.waiting_for_command.discard(user_id)
 
-    async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handles receiving a file and saving it to /root."""
+    async def handle_media(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handles receiving any media and saving it to /root."""
         chat_id = update.effective_chat.id
         if not self.is_admin(chat_id):
-            logger.warning(f"Unauthorized document upload attempt from chat_id: {chat_id}")
+            logger.warning(f"Unauthorized media upload attempt from chat_id: {chat_id}")
             return
 
-        doc = update.message.document
-        file_name = doc.file_name
+        media_obj = None
+        file_name = None
+        
+        # Determine file type and get file object and name
+        if update.message.document:
+            media_obj = update.message.document
+            file_name = media_obj.file_name
+        elif update.message.video:
+            media_obj = update.message.video
+            file_name = media_obj.file_name
+        elif update.message.photo:
+            media_obj = update.message.photo[-1] # Highest resolution
+            # Photos don't have a filename, create one from unique_id
+            file_name = f"{media_obj.file_unique_id}.jpg"
+        
+        if not media_obj:
+            # This case should ideally not be hit if filters are correct
+            await update.message.reply_text("❌ Tipe file tidak didukung.", reply_markup=self._get_back_button())
+            return
+            
         dest_path = f"/root/{file_name}"
         
         # Sanitize filename to prevent path traversal
@@ -527,8 +545,8 @@ class VPSAdminBot:
         progress_msg = await update.message.reply_text(f"📤 Mengunggah `{file_name}`...")
 
         try:
-            file = await doc.get_file()
-            await file.download_to_drive(custom_path=dest_path)
+            file_to_download = await media_obj.get_file()
+            await file_to_download.download_to_drive(custom_path=dest_path)
             
             logger.info(f"File '{file_name}' uploaded to '{dest_path}' by user {update.effective_user.id}")
             await progress_msg.edit_text(
@@ -749,7 +767,7 @@ def main():
     application.add_handler(CommandHandler("help", bot.help_command))
     application.add_handler(CallbackQueryHandler(bot.button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.message_handler))
-    application.add_handler(MessageHandler(filters.Document.ALL, bot.handle_document))
+    application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO, bot.handle_media))
     
     logger.info("VPS Admin Bot started...")
     print("✅ VPS Admin Bot started successfully!")
