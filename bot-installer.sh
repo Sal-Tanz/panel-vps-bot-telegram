@@ -182,15 +182,27 @@ class VPSAdminBot:
     def _get_main_menu_keyboard(self):
         """Returns the InlineKeyboardMarkup for the main menu."""
         keyboard = [
-            [InlineKeyboardButton("📊 System Info", callback_data='sysinfo')],
-            [InlineKeyboardButton("🔄 Reboot Server", callback_data='reboot')],
-            [InlineKeyboardButton("🔐 Change Root Password", callback_data='change_pass')],
-            [InlineKeyboardButton("🌐 Speedtest", callback_data='speedtest')],
-            [InlineKeyboardButton("💾 Disk Usage", callback_data='disk_usage')],
-            [InlineKeyboardButton("📈 Resource Monitor", callback_data='resources')],
-            [InlineKeyboardButton("🔧 Services Status", callback_data='services')],
-            [InlineKeyboardButton("📋 Running Processes", callback_data='processes')],
-            [InlineKeyboardButton("⚡ Custom Command", callback_data='custom_cmd')]
+            [
+                InlineKeyboardButton("📊 Sys Info", callback_data='sysinfo'),
+                InlineKeyboardButton("📈 Resources", callback_data='resources')
+            ],
+            [
+                InlineKeyboardButton("💾 Disk", callback_data='disk_usage'),
+                InlineKeyboardButton("📋 Processes", callback_data='processes'),
+            ],
+            [
+                InlineKeyboardButton("🔧 Services", callback_data='services'),
+                InlineKeyboardButton("🌐 Speedtest", callback_data='speedtest')
+            ],
+            [
+                InlineKeyboardButton("📤 Upload File", callback_data='upload_file'),
+                InlineKeyboardButton("⚡ Custom Cmd", callback_data='custom_cmd')
+                
+            ],
+            [
+                InlineKeyboardButton("🔐 Change Pass", callback_data='change_pass'),
+                InlineKeyboardButton("🔄 Reboot", callback_data='reboot')
+            ]
         ]
         return InlineKeyboardMarkup(keyboard)
 
@@ -264,6 +276,12 @@ class VPSAdminBot:
                 await self.running_processes(query)
             elif query.data == 'custom_cmd':
                 await self.custom_command_prompt(query)
+            elif query.data == 'upload_file':
+                await query.edit_message_text(
+                    "Silakan kirim file yang ingin Anda unggah.\n"
+                    "File akan disimpan di direktori `/root`.",
+                    reply_markup=self._get_back_button()
+                )
             elif query.data == 'main_menu':
                 user_id = query.from_user.id
                 self.waiting_for_password.discard(user_id)
@@ -486,6 +504,49 @@ class VPSAdminBot:
         finally:
             self.waiting_for_command.discard(user_id)
 
+    async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handles receiving a file and saving it to /root."""
+        chat_id = update.effective_chat.id
+        if not self.is_admin(chat_id):
+            logger.warning(f"Unauthorized document upload attempt from chat_id: {chat_id}")
+            return
+
+        doc = update.message.document
+        file_name = doc.file_name
+        dest_path = f"/root/{file_name}"
+        
+        # Sanitize filename to prevent path traversal
+        if ".." in file_name or "/" in file_name:
+            await update.message.reply_text(
+                f"❌ Nama file tidak valid: `{file_name}`",
+                parse_mode='Markdown',
+                reply_markup=self._get_back_button()
+            )
+            return
+
+        progress_msg = await update.message.reply_text(f"📤 Mengunggah `{file_name}`...")
+
+        try:
+            file = await doc.get_file()
+            await file.download_to_drive(custom_path=dest_path)
+            
+            logger.info(f"File '{file_name}' uploaded to '{dest_path}' by user {update.effective_user.id}")
+            await progress_msg.edit_text(
+                f"✅ File berhasil disimpan!\n\n"
+                f"**Nama:** `{file_name}`\n"
+                f"**Lokasi:** `{dest_path}`",
+                parse_mode='Markdown',
+                reply_markup=self._get_back_button()
+            )
+        except Exception as e:
+            logger.error(f"Failed to download file '{file_name}': {e}")
+            await progress_msg.edit_text(
+                f"❌ Gagal menyimpan file `{file_name}`.\n\n"
+                f"**Error:** `{str(e)}`",
+                parse_mode='Markdown',
+                reply_markup=self._get_back_button()
+            )
+
     async def speedtest(self, query):
         """Menjalankan speedtest"""
         try:
@@ -688,6 +749,7 @@ def main():
     application.add_handler(CommandHandler("help", bot.help_command))
     application.add_handler(CallbackQueryHandler(bot.button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.message_handler))
+    application.add_handler(MessageHandler(filters.Document.ALL, bot.handle_document))
     
     logger.info("VPS Admin Bot started...")
     print("✅ VPS Admin Bot started successfully!")
