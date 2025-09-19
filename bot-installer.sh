@@ -144,40 +144,43 @@ class VPSAdminBot:
         return int(chat_id) in [int(admin_id) for admin_id in ADMIN_CHAT_IDS]
     
     async def run_command(self, command, timeout=30):
-        """Menjalankan command shell dengan aman"""
+        """Menjalankan command shell dengan aman dan non-blocking"""
         try:
-            # Sanitize command untuk keamanan
             if any(dangerous in command.lower() for dangerous in ['rm -rf /', 'dd if=', 'mkfs', 'fdisk']):
-                return "❌ Command berbahaya tidak diizinkan"
+                return "", "❌ Command berbahaya tidak diizinkan", 1
             
             logger.info(f"Executing command: {command}")
             
-            result = subprocess.run(
-                command, 
-                shell=True, 
-                capture_output=True, 
-                text=True, 
-                timeout=timeout
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
             
-            output = result.stdout + result.stderr
-            logger.info(f"Command output: {output[:200]}...")
-            return output
-            
-        except subprocess.TimeoutExpired:
-            return f"❌ Command timeout (>{timeout}s)"
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                stdout_str = stdout.decode('utf-8', errors='ignore').strip()
+                stderr_str = stderr.decode('utf-8', errors='ignore').strip()
+                
+                if stdout_str:
+                    logger.info(f"Command stdout: {stdout_str[:200]}...")
+                if stderr_str:
+                    logger.warning(f"Command stderr: {stderr_str[:200]}...")
+                    
+                return stdout_str, stderr_str, proc.returncode
+                
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.warning(f"Command timeout (>{timeout}s): {command}")
+                return "", f"❌ Command timeout (>{timeout}s)", -1
+                
         except Exception as e:
-            logger.error(f"Error executing command: {e}")
-            return f"❌ Error: {str(e)}"
+            logger.error(f"Error executing command '{command}': {e}")
+            return "", f"❌ Error: {str(e)}", -1
 
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Command /start"""
-        chat_id = update.effective_chat.id
-        if not self.is_admin(chat_id):
-            await update.message.reply_text("❌ Akses ditolak. Anda bukan admin.")
-            logger.warning(f"Unauthorized access attempt from chat_id: {chat_id}")
-            return
-            
+    def _get_main_menu_keyboard(self):
+        """Returns the InlineKeyboardMarkup for the main menu."""
         keyboard = [
             [InlineKeyboardButton("📊 System Info", callback_data='sysinfo')],
             [InlineKeyboardButton("🔄 Reboot Server", callback_data='reboot')],
@@ -189,15 +192,48 @@ class VPSAdminBot:
             [InlineKeyboardButton("📋 Running Processes", callback_data='processes')],
             [InlineKeyboardButton("⚡ Custom Command", callback_data='custom_cmd')]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
+        return InlineKeyboardMarkup(keyboard)
+
+    def _get_back_button(self):
+        """Returns an InlineKeyboardMarkup with a back button."""
+        keyboard = [
+            [InlineKeyboardButton("⬅️ Kembali ke Menu", callback_data='main_menu')]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+
+    async def _send_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Sends the main menu, editing the message if it's from a callback query."""
+        text = (
             "🖥️ *VPS Admin Panel*\n\n"
             "Selamat datang di panel administrasi VPS!\n"
-            "Pilih aksi yang ingin dilakukan:",
-            parse_mode='Markdown',
-            reply_markup=reply_markup
+            "Pilih aksi yang ingin dilakukan:"
         )
+        reply_markup = self._get_main_menu_keyboard()
+        
+        # Check if the update is from a callback query (button press)
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                text,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+        # Otherwise, it's a command, so reply with a new message
+        else:
+            await update.message.reply_text(
+                text,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Command /start"""
+        chat_id = update.effective_chat.id
+        if not self.is_admin(chat_id):
+            await update.message.reply_text("❌ Akses ditolak. Anda bukan admin.")
+            logger.warning(f"Unauthorized access attempt from chat_id: {chat_id}")
+            return
+        
+        await self._send_main_menu(update, context)
 
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler untuk inline keyboard"""
@@ -228,11 +264,19 @@ class VPSAdminBot:
                 await self.running_processes(query)
             elif query.data == 'custom_cmd':
                 await self.custom_command_prompt(query)
+            elif query.data == 'main_menu':
+                user_id = query.from_user.id
+                self.waiting_for_password.discard(user_id)
+                self.waiting_for_command.discard(user_id)
+                await self._send_main_menu(update, context)
             elif query.data == 'confirm_reboot':
                 await query.edit_message_text("🔄 Server sedang direboot... Bot akan offline sementara.")
                 await self.run_command("sleep 2 && sudo reboot")
             elif query.data == 'cancel':
-                await query.edit_message_text("❌ Operasi dibatalkan.")
+                user_id = query.from_user.id
+                self.waiting_for_password.discard(user_id)
+                self.waiting_for_command.discard(user_id)
+                await query.edit_message_text("❌ Operasi dibatalkan.", reply_markup=self._get_back_button())
         except Exception as e:
             logger.error(f"Error in button handler: {e}")
             await query.edit_message_text(f"❌ Error: {str(e)}")
@@ -242,24 +286,40 @@ class VPSAdminBot:
         try:
             await query.edit_message_text("📊 Mengambil informasi sistem...")
             
-            hostname = os.uname().nodename
-            uptime_output = await self.run_command("uptime")
-            cpu_percent = psutil.cpu_percent(interval=2)
-            memory = psutil.virtual_memory()
-            disk = psutil.disk_usage('/')
-            network = psutil.net_io_counters()
+            # Jalankan command secara paralel
+            uptime_task = self.run_command("uptime")
+            os_info_task = self.run_command("lsb_release -d 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d'=' -f2 | tr -d '\"'")
+            kernel_info_task = self.run_command("uname -r")
             
-            # Get OS info
-            os_info = await self.run_command("lsb_release -d 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d'=' -f2 | tr -d '\"'")
-            kernel_info = await self.run_command("uname -r")
+            # Jalankan psutil calls di thread terpisah
+            cpu_percent_task = asyncio.to_thread(psutil.cpu_percent, interval=1)
+            virtual_memory_task = asyncio.to_thread(psutil.virtual_memory)
+            disk_usage_task = asyncio.to_thread(psutil.disk_usage, '/')
+            net_io_counters_task = asyncio.to_thread(psutil.net_io_counters)
+            
+            # Tunggu semua task selesai
+            results = await asyncio.gather(
+                uptime_task, os_info_task, kernel_info_task, 
+                cpu_percent_task, virtual_memory_task, disk_usage_task, net_io_counters_task
+            )
+            
+            uptime_stdout, _, _ = results[0]
+            os_info_stdout, _, _ = results[1]
+            kernel_info_stdout, _, _ = results[2]
+            cpu_percent = results[3]
+            memory = results[4]
+            disk = results[5]
+            network = results[6]
+            
+            hostname = os.uname().nodename
             
             info = f"""
 🖥️ *System Information*
 
 📡 **Hostname:** `{hostname}`
-🐧 **OS:** `{os_info.strip()}`
-🔧 **Kernel:** `{kernel_info.strip()}`
-⏰ **Uptime:** `{uptime_output.strip()}`
+🐧 **OS:** `{os_info_stdout.strip()}`
+🔧 **Kernel:** `{kernel_info_stdout.strip()}`
+⏰ **Uptime:** `{uptime_stdout.strip()}`
 
 💻 **CPU Usage:** `{cpu_percent}%`
 🧠 **Memory:** `{memory.percent:.1f}%` ({memory.available // (1024**3):.1f}GB available)
@@ -276,11 +336,11 @@ class VPSAdminBot:
 🔄 **Load Average:** `{os.getloadavg()[0]:.2f}, {os.getloadavg()[1]:.2f}, {os.getloadavg()[2]:.2f}`
 """
             
-            await query.edit_message_text(info, parse_mode='Markdown')
+            await query.edit_message_text(info, parse_mode='Markdown', reply_markup=self._get_back_button())
             
         except Exception as e:
             logger.error(f"Error getting system info: {e}")
-            await query.edit_message_text(f"❌ Error getting system info: {str(e)}")
+            await query.edit_message_text(f"❌ Error getting system info: {str(e)}", reply_markup=self._get_back_button())
 
     async def reboot_server(self, query):
         """Reboot server dengan konfirmasi"""
@@ -312,7 +372,8 @@ class VPSAdminBot:
             "• Gunakan password yang kuat\n"
             "• Pesan akan dihapus otomatis\n\n"
             "Ketik `/cancel` untuk membatalkan.",
-            parse_mode='Markdown'
+            parse_mode='Markdown',
+            reply_markup=self._get_back_button()
         )
 
     async def custom_command_prompt(self, query):
@@ -328,7 +389,8 @@ class VPSAdminBot:
             "• Timeout: 30 detik\n"
             "• Gunakan dengan hati-hati\n\n"
             "Ketik `/cancel` untuk membatalkan.",
-            parse_mode='Markdown'
+            parse_mode='Markdown',
+            reply_markup=self._get_back_button()
         )
 
     async def message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -345,8 +407,11 @@ class VPSAdminBot:
         if message_text == '/cancel':
             self.waiting_for_password.discard(user_id)
             self.waiting_for_command.discard(user_id)
-            await update.message.reply_text("❌ Operasi dibatalkan.")
-            await update.message.delete()
+            await update.message.reply_text("❌ Operasi dibatalkan.", reply_markup=self._get_back_button())
+            try:
+                await update.message.delete()
+            except:
+                pass # Ignore if message already deleted
             return
         
         # Handle password input
@@ -369,24 +434,25 @@ class VPSAdminBot:
             
             # Validasi password
             if len(new_password) < 6:
-                await update.message.reply_text("❌ Password minimal 6 karakter!")
+                await update.message.reply_text("❌ Password minimal 6 karakter!", reply_markup=self._get_back_button())
                 return
             
             # Escape password untuk shell
             escaped_password = shlex.quote(new_password)
             command = f"echo 'root:{escaped_password}' | chpasswd"
             
-            result = await self.run_command(command)
+            stdout, stderr, retcode = await self.run_command(command)
             
-            if result and ("error" in result.lower() or "failed" in result.lower()):
-                await update.message.reply_text(f"❌ Gagal mengganti password:\n```\n{result}\n```", parse_mode='Markdown')
+            if retcode != 0:
+                error_message = stderr if stderr else stdout
+                await update.message.reply_text(f"❌ Gagal mengganti password:\n```\n{error_message}\n```", parse_mode='Markdown', reply_markup=self._get_back_button())
             else:
-                await update.message.reply_text("✅ Password root berhasil diubah!")
+                await update.message.reply_text("✅ Password root berhasil diubah!", reply_markup=self._get_back_button())
                 logger.info(f"Root password changed by user {user_id}")
             
         except Exception as e:
             logger.error(f"Error changing password: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)}")
+            await update.message.reply_text(f"❌ Error: {str(e)}", reply_markup=self._get_back_button())
         finally:
             self.waiting_for_password.discard(user_id)
 
@@ -400,17 +466,23 @@ class VPSAdminBot:
             # Send "processing" message
             processing_msg = await update.message.reply_text(f"⚡ Menjalankan command: `{command[:50]}...`", parse_mode='Markdown')
             
-            result = await self.run_command(command)
+            stdout, stderr, retcode = await self.run_command(command)
             
-            if len(result) > 4000:
-                result = result[:4000] + "\n\n... (output dipotong)"
+            output = f"Exit Code: {retcode}\n"
+            if stdout:
+                output += f"\n--- STDOUT ---\n{stdout}\n"
+            if stderr:
+                output += f"\n--- STDERR ---\n{stderr}\n"
+
+            if len(output) > 4000:
+                output = output[:4000] + "\n\n... (output dipotong)"
             
-            await processing_msg.edit_text(f"⚡ *Command Output:*\n\n```\n{result}\n```", parse_mode='Markdown')
+            await processing_msg.edit_text(f"⚡ *Command Output:*\n\n```\n{output}\n```", parse_mode='Markdown', reply_markup=self._get_back_button())
             logger.info(f"Custom command executed by user {user_id}: {command}")
             
         except Exception as e:
             logger.error(f"Error executing custom command: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)}")
+            await update.message.reply_text(f"❌ Error: {str(e)}", reply_markup=self._get_back_button())
         finally:
             self.waiting_for_command.discard(user_id)
 
@@ -420,51 +492,63 @@ class VPSAdminBot:
             await query.edit_message_text("🌐 Menjalankan speedtest... (ini mungkin memakan waktu 30-60 detik)")
             
             # Check if speedtest-cli is installed
-            check_result = await self.run_command("which speedtest-cli")
-            if "not found" in check_result:
-                await query.edit_message_text("📦 Installing speedtest-cli...")
-                install_result = await self.run_command("pip3 install speedtest-cli")
+            _, _, retcode = await self.run_command("which speedtest-cli")
+            if retcode != 0:
+                await query.edit_message_text("📦 speedtest-cli tidak ditemukan, menginstall...")
+                _, stderr, install_retcode = await self.run_command("pip3 install speedtest-cli --break-system-packages")
+                if install_retcode != 0:
+                    await query.edit_message_text(f"❌ Gagal menginstall speedtest-cli:\n```\n{stderr}\n```", parse_mode='Markdown', reply_markup=self._get_back_button())
+                    return
+
+            stdout, stderr, retcode = await self.run_command("speedtest-cli --simple", timeout=120)
             
-            result = await self.run_command("speedtest-cli --simple", timeout=120)
-            
-            if result and len(result.strip()) > 0:
-                await query.edit_message_text(f"🌐 *Speedtest Results*\n\n```\n{result}\n```", parse_mode='Markdown')
+            if retcode == 0 and stdout:
+                await query.edit_message_text(f"🌐 *Speedtest Results*\n\n```\n{stdout}\n```", parse_mode='Markdown', reply_markup=self._get_back_button())
             else:
-                await query.edit_message_text("❌ Gagal menjalankan speedtest. Coba install manual: `pip3 install speedtest-cli`")
+                error_message = stderr if stderr else "Output kosong."
+                await query.edit_message_text(f"❌ Gagal menjalankan speedtest.\n\n`{error_message}`", reply_markup=self._get_back_button())
         except Exception as e:
             logger.error(f"Error running speedtest: {e}")
-            await query.edit_message_text(f"❌ Error speedtest: {str(e)}")
+            await query.edit_message_text(f"❌ Error speedtest: {str(e)}", reply_markup=self._get_back_button())
 
     async def disk_usage(self, query):
         """Menampilkan penggunaan disk"""
         try:
-            result = await self.run_command("df -h")
-            await query.edit_message_text(f"💾 *Disk Usage*\n\n```\n{result}\n```", parse_mode='Markdown')
+            stdout, stderr, retcode = await self.run_command("df -h")
+            if retcode == 0:
+                await query.edit_message_text(f"💾 *Disk Usage*\n\n```\n{stdout}\n```", parse_mode='Markdown', reply_markup=self._get_back_button())
+            else:
+                await query.edit_message_text(f"❌ Gagal mengambil info disk:\n```\n{stderr}\n```", parse_mode='Markdown', reply_markup=self._get_back_button())
         except Exception as e:
-            await query.edit_message_text(f"❌ Error: {str(e)}")
+            await query.edit_message_text(f"❌ Error: {str(e)}", reply_markup=self._get_back_button())
 
     async def resource_monitor(self, query):
         """Monitor resource real-time"""
         try:
             await query.edit_message_text("📈 Mengumpulkan data resource...")
             
-            cpu = psutil.cpu_percent(interval=2)
-            memory = psutil.virtual_memory()
-            disk = psutil.disk_usage('/')
+            # Jalankan psutil calls di thread terpisah
+            cpu_task = asyncio.to_thread(psutil.cpu_percent, interval=1)
+            mem_task = asyncio.to_thread(psutil.virtual_memory)
+            disk_task = asyncio.to_thread(psutil.disk_usage, '/')
+            
+            cpu, memory, disk = await asyncio.gather(cpu_task, mem_task, disk_task)
             load_avg = os.getloadavg()
             
-            # Get top processes
+            # Get top processes (ini juga blocking, tapi cepat)
             processes = []
-            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
-                try:
-                    proc_info = proc.info
-                    if proc_info['cpu_percent'] and proc_info['cpu_percent'] > 0:
-                        processes.append(proc_info)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
+            def get_procs():
+                for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+                    try:
+                        proc_info = proc.info
+                        if proc_info['cpu_percent'] and proc_info['cpu_percent'] > 0:
+                            processes.append(proc_info)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+                return sorted(processes, key=lambda x: x['cpu_percent'] or 0, reverse=True)[:5]
             
-            top_processes = sorted(processes, key=lambda x: x['cpu_percent'] or 0, reverse=True)[:5]
-            
+            top_processes = await asyncio.to_thread(get_procs)
+
             monitor_text = f"""
 📈 *Resource Monitor*
 
@@ -485,46 +569,68 @@ class VPSAdminBot:
                 if proc['cpu_percent']:
                     monitor_text += f"• `{proc['name'][:15]}` ({proc['pid']}): {proc['cpu_percent']:.1f}%\n"
             
-            await query.edit_message_text(monitor_text, parse_mode='Markdown')
+            await query.edit_message_text(monitor_text, parse_mode='Markdown', reply_markup=self._get_back_button())
             
         except Exception as e:
             logger.error(f"Error monitoring resources: {e}")
-            await query.edit_message_text(f"❌ Error monitoring resources: {str(e)}")
+            await query.edit_message_text(f"❌ Error monitoring resources: {str(e)}", reply_markup=self._get_back_button())
 
     async def services_status(self, query):
-        """Cek status layanan penting"""
+        """Cek status layanan penting dengan cara yang lebih andal"""
         try:
+            await query.edit_message_text("🔧 Mengecek status layanan...")
             services = ['ssh', 'sshd', 'nginx', 'apache2', 'mysql', 'mariadb', 'postgresql', 'docker', 'ufw']
             status_text = "🔧 *Services Status*\n\n"
             
-            for service in services:
-                result = await self.run_command(f"systemctl is-active {service} 2>/dev/null")
-                status = result.strip()
-                
-                if status == "active":
-                    status_text += f"✅ `{service}`: Running\n"
-                elif status == "inactive":
-                    status_text += f"⏸️ `{service}`: Stopped\n"
-                elif status == "failed":
-                    status_text += f"❌ `{service}`: Failed\n"
-                else:
-                    status_text += f"❓ `{service}`: Not installed\n"
+            checked_services = set()
             
-            await query.edit_message_text(status_text, parse_mode='Markdown')
+            for service in services:
+                if service in checked_services:
+                    continue
+                
+                # Gunakan `systemctl status` untuk exit code yang andal
+                _, _, retcode = await self.run_command(f"systemctl status {service} > /dev/null 2>&1")
+                
+                if retcode == 4: # Unit not found
+                    status_text += f"❓ `{service}`: Not installed\n"
+                    continue
+
+                # Cek is-active dan is-enabled secara paralel
+                active_task = self.run_command(f"systemctl is-active {service}")
+                enabled_task = self.run_command(f"systemctl is-enabled {service}")
+                
+                active_res, enabled_res = await asyncio.gather(active_task, enabled_task)
+                
+                status = active_res[0].strip()
+                enabled_status = "enabled" if enabled_res[2] == 0 else "disabled"
+
+                if status == "active":
+                    status_text += f"✅ `{service}`: Running ({enabled_status})\n"
+                elif status == "failed":
+                    status_text += f"❌ `{service}`: Failed ({enabled_status})\n"
+                else: # inactive, deactivating, etc.
+                    status_text += f"⏸️ `{service}`: Stopped ({enabled_status})\n"
+
+                checked_services.add(service)
+
+            await query.edit_message_text(status_text, parse_mode='Markdown', reply_markup=self._get_back_button())
         except Exception as e:
-            await query.edit_message_text(f"❌ Error: {str(e)}")
+            logger.error(f"Error checking services status: {e}")
+            await query.edit_message_text(f"❌ Error: {str(e)}", reply_markup=self._get_back_button())
 
     async def running_processes(self, query):
         """Menampilkan proses yang berjalan"""
         try:
-            result = await self.run_command("ps aux --sort=-%cpu | head -20")
+            stdout, stderr, retcode = await self.run_command("ps aux --sort=-%cpu | head -20")
             
-            if len(result) > 4000:
-                result = result[:4000] + "\n... (output dipotong)"
-                
-            await query.edit_message_text(f"📋 *Running Processes*\n\n```\n{result}\n```", parse_mode='Markdown')
+            if retcode == 0:
+                if len(stdout) > 4000:
+                    stdout = stdout[:4000] + "\n... (output dipotong)"
+                await query.edit_message_text(f"📋 *Running Processes*\n\n```\n{stdout}\n```", parse_mode='Markdown', reply_markup=self._get_back_button())
+            else:
+                await query.edit_message_text(f"❌ Gagal mengambil daftar proses:\n```\n{stderr}\n```", parse_mode='Markdown', reply_markup=self._get_back_button())
         except Exception as e:
-            await query.edit_message_text(f"❌ Error: {str(e)}")
+            await query.edit_message_text(f"❌ Error: {str(e)}", reply_markup=self._get_back_button())
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Command /help"""
